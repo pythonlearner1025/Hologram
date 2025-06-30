@@ -26,7 +26,7 @@ key = random.PRNGKey(42)
 # Timestamp of last modification
 import time
 import os
-TIMESTAMP = time.strftime("%Y-%m-%d %H:%M:%S")  # UTC
+TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")  # Format without spaces
 
 # Create output directory with timestamp
 OUTPUT_DIR = f'/workspace/hologram/outs/{TIMESTAMP}'
@@ -42,24 +42,29 @@ SOUND_SPEED_WATER = 1500  # m/s
 WAVELENGTH = SOUND_SPEED_WATER / FREQ_HZ  # meters
 OMEGA = 2 * jnp.pi * FREQ_HZ
 
+# Material properties
+# Water properties
+DENSITY_WATER = 1000  # kg/m^3
+ABSORPTION_WATER = 0.0  # Np/m (negligible for water)
+
 # Bowl transducer parameters (in mm)
 BOWL_DIAMETER_MM = 15.0
 BOWL_ROC_MM = 23.0  # Radius of curvature
 VMAX = 0.1
 
 # Target focal point
-FOCAL_DISTANCE_MM = 30.0 # Target focal point distance from origin (z-axis)
+FOCAL_DISTANCE_MM = 55.0 # Target focal point distance from origin (z-axis)
 
 # Objective function type selection
 # Options: "point", "area_contrast", "uniform", "sidelobe"
-OBJECTIVE_TYPE = "sidelobe"
+OBJECTIVE_TYPE = "focal_area"
 
 # Target area parameters (for area-based objectives)
-TARGET_RADIUS_MM = 2.0  # Radius of circular target area
+TARGET_RADIUS_MM = 1.0  # Radius of circular target area
 SIDELOBE_RADIUS_MM = 5.0  # Radius for sidelobe suppression region
 
 # Grid parameters
-GRID_SIZE_MM = (25, 50)  # x, z dimensions in mm
+GRID_SIZE_MM = (25, 65)  # x, z dimensions in mm
 PPW = 3  # Points per wavelength
 dx_m = WAVELENGTH / PPW  # Grid spacing in meters
 dx_mm = dx_m * 1000  # Grid spacing in mm
@@ -73,12 +78,14 @@ N = (
 # Create simulation domain
 domain = Domain(N, (dx_m, dx_m))
 
-# Lens region parameters
+# Optimization region parameters
 # This is the area where we will optimize the sound speed
-NUM_LENS_STACKS = 3
-LENS_WIDTH_MM = 15.0
-LENS_THICKNESS_MM = 3.0
-LENS_START_Z_MM = 3.0 # z-position where the lens begins
+OPTIMIZATION_WIDTH_MM = 15.0
+OPTIMIZATION_THICKNESS_MM = 0.6  # Optimizable region thickness
+OPTIMIZATION_START_Z_MM = 3.0 # z-position where the optimization region begins
+
+# Formlabs xy max resolution is 0.05mm
+MAX_X_RESOLUTION_MM = 0.05
 
 # 2. SOURCE AND LENS DEFINITIONS
 # ===============================
@@ -128,62 +135,63 @@ def create_bowl_source(domain):
     return FourierSeries(jnp.expand_dims(source_field, -1), domain)
 
 
-def create_optimizable_sos_map(lens_params, domain):
+def create_sos_map(optimization_params, domain):
     """
-    Creates a sound speed map where a specific region (the lens) has its
-    sound speed controlled by the `lens_params` vector.
-    This is based on the tutorial's `get_sos` function.
+    Creates a sound speed map for the optimization region.
+    This version directly uses optimization parameters to control sound speed without constraints.
+    
+    Args:
+        optimization_params: Optimization parameters (one per voxel in optimization region)
+        domain: Simulation domain
+    
+    Returns:
+        FourierSeries containing the sound speed map
     """
+    # Define the grid coordinates for the optimization region in voxels
+    opt_x_center_vox = N[0] // 2
+    opt_width_vox = int(OPTIMIZATION_WIDTH_MM / dx_mm)
+    opt_start_x_vox = opt_x_center_vox - opt_width_vox // 2
+    
+    opt_start_z_vox = int(OPTIMIZATION_START_Z_MM / dx_mm)
+    opt_thickness_vox = int(OPTIMIZATION_THICKNESS_MM / dx_mm)
+    
+    # Total number of optimizable voxels
+    expected_params = opt_width_vox * opt_thickness_vox
+    if len(optimization_params) != expected_params:
+        raise ValueError(f"optimization_params length ({len(optimization_params)}) must match "
+                        f"optimization voxels ({expected_params} = {opt_width_vox} x {opt_thickness_vox})")
+    
     # Start with a uniform sound speed of water
     sos_map = jnp.ones(N) * SOUND_SPEED_WATER
     
-    # Define the grid coordinates for the lens region in voxels
-    lens_x_center_vox = N[0] // 2
-    lens_width_vox = int(LENS_WIDTH_MM / dx_mm)
-    lens_start_x_vox = lens_x_center_vox - lens_width_vox // 2
+    # Reshape optimization parameters to match optimization region geometry
+    opt_params_2d = jnp.reshape(optimization_params, (opt_width_vox, opt_thickness_vox))
     
-    lens_start_z_vox = int(LENS_START_Z_MM / dx_mm)
-    lens_thickness_vox = int(LENS_THICKNESS_MM / dx_mm)
+    # Apply tanh to keep sound speeds in a reasonable range
+    # This maps parameters to a range between min and max sound speeds
+    min_sos = 1000.0  # Minimum sound speed (m/s)
+    max_sos = 2000.0  # Maximum sound speed (m/s)
+    center_sos = (min_sos + max_sos) / 2
+    range_sos = (max_sos - min_sos) / 2
     
-    # Ensure the number of lens parameters matches the number of segments
-    num_segments = lens_width_vox
-    if len(lens_params) != num_segments:
-        raise ValueError(f"lens_params length ({len(lens_params)}) must match lens width in voxels ({num_segments})")
-
-    # Use jax.nn.sigmoid to map the parameters to a sound speed multiplier
-    # This keeps the sound speed within a reasonable range (e.g., 0.7 to 1.3 times water)
-    # The multiplier is shaped to match the segments of the lens
-    # TODO the range should be defined by printable material properties
-    sound_speed_multiplier = 0.7 + 0.6 * jax.nn.sigmoid(lens_params)
+    # Use tanh to smoothly map parameters to sound speed range
+    opt_sound_speeds = center_sos + range_sos * jnp.tanh(opt_params_2d)
     
-    # Create a broadcastable shape for the multiplier
-    multiplier_reshaped = jnp.reshape(sound_speed_multiplier, (num_segments, 1))
-    # Broadcast to match lens thickness
-    multiplier_reshaped = jnp.broadcast_to(multiplier_reshaped, (num_segments, lens_thickness_vox))
-
-    print(f"sound_speed_multiplier: {sound_speed_multiplier.shape}")
-
-    # Apply the multiplier to the lens region in the sound speed map
-    # Each parameter controls a vertical slice of the lens
-    lens_region = sos_map[lens_start_x_vox : lens_start_x_vox + num_segments,
-                          lens_start_z_vox : lens_start_z_vox + lens_thickness_vox]
-    
-    updated_lens_region = SOUND_SPEED_WATER * multiplier_reshaped
-    
+    # Apply to optimization region
     sos_map = sos_map.at[
-        lens_start_x_vox : lens_start_x_vox + num_segments,
-        lens_start_z_vox : lens_start_z_vox + lens_thickness_vox
-    ].set(updated_lens_region)
-
+        opt_start_x_vox : opt_start_x_vox + opt_width_vox,
+        opt_start_z_vox : opt_start_z_vox + opt_thickness_vox
+    ].set(opt_sound_speeds)
+    
     return FourierSeries(jnp.expand_dims(sos_map, -1), domain)
 
 
 # 3. SIMULATION AND OBJECTIVE FUNCTION
 # ====================================
 
-def compute_field(lens_params, source, domain):
-    """Compute the acoustic field for the given lens sound speed parameters."""
-    sound_speed = create_optimizable_sos_map(lens_params, domain)
+def compute_field(optimization_params, source, domain):
+    """Compute the acoustic field for the given optimization parameters."""
+    sound_speed = create_sos_map(optimization_params, domain)
     medium = Medium(domain=domain, sound_speed=sound_speed, pml_size=20)
     
     # Based on the tutorial, helmholtz_solver expects:
@@ -199,12 +207,12 @@ def compute_field(lens_params, source, domain):
     
     return field
 
-def objective(lens_params, source, domain):
+def objective(optimization_params, source, domain):
     """
     Objective function: maximize the acoustic pressure at the target point.
     We minimize the negative of the pressure.
     """
-    field = compute_field(lens_params, source, domain)
+    field = compute_field(optimization_params, source, domain)
     # Based on the tutorial, field.on_grid gives us the pressure field
     field_on_grid = field.on_grid
     
@@ -222,102 +230,49 @@ def objective(lens_params, source, domain):
     return -target_pressure
 
 
-# Helper function for creating target masks
 def create_circular_mask(center_x_mm, center_z_mm, radius_mm):
-    """Create a circular mask for the target area."""
+    """Create a circular mask on the grid."""
     x = jnp.arange(N[0]) * dx_mm
     z = jnp.arange(N[1]) * dx_mm
     X, Z = jnp.meshgrid(x, z, indexing='ij')
     
-    # Distance from center
+    distance = jnp.sqrt((X - center_x_mm)**2 + (Z - center_z_mm)**2)
+    return distance <= radius_mm
+
+def objective_focal_area(optimization_params, source, domain):
+    """Maximize average pressure in focal area."""
+    field = compute_field(optimization_params, source, domain)
+    field_on_grid = field.on_grid
+    
+    if field_on_grid.ndim == 3:
+        pressure_magnitude = jnp.abs(field_on_grid[..., 0])
+    else:
+        pressure_magnitude = jnp.abs(field_on_grid)
+    
+    # Create circular target mask
+    x = jnp.arange(N[0]) * dx_mm
+    z = jnp.arange(N[1]) * dx_mm
+    X, Z = jnp.meshgrid(x, z, indexing='ij')
+    
+    center_x_mm = GRID_SIZE_MM[0] / 2
+    center_z_mm = FOCAL_DISTANCE_MM
+    
     dist = jnp.sqrt((X - center_x_mm)**2 + (Z - center_z_mm)**2)
+    target_mask = (dist <= TARGET_RADIUS_MM).astype(jnp.float32)
     
-    return dist <= radius_mm
-
-
-# Area-based objective functions
-def objective_area_contrast(lens_params, source, domain):
-    """
-    Maximize contrast between target area and surrounding region.
-    Contrast = (mean pressure in target) / (mean pressure outside target)
-    """
-    field = compute_field(lens_params, source, domain)
-    field_on_grid = field.on_grid
-    
-    if field_on_grid.ndim == 3:
-        pressure_magnitude = jnp.abs(field_on_grid[..., 0])
-    else:
-        pressure_magnitude = jnp.abs(field_on_grid)
-    
-    # Create target area mask
-    target_mask = create_circular_mask(
-        center_x_mm=GRID_SIZE_MM[0]/2,
-        center_z_mm=FOCAL_DISTANCE_MM,
-        radius_mm=TARGET_RADIUS_MM
-    )
-    
-    # Convert boolean mask to float for JAX compatibility
-    target_mask_float = target_mask.astype(jnp.float32)
-    non_target_mask_float = 1.0 - target_mask_float
-    
-    # Calculate mean pressures using weighted sums
-    target_sum = jnp.sum(pressure_magnitude * target_mask_float)
-    target_count = jnp.sum(target_mask_float)
-    target_pressure = target_sum / (target_count + 1e-8)
-    
-    non_target_sum = jnp.sum(pressure_magnitude * non_target_mask_float)
-    non_target_count = jnp.sum(non_target_mask_float)
-    non_target_pressure = non_target_sum / (non_target_count + 1e-8)
-    
-    # Maximize contrast ratio
-    contrast = target_pressure / (non_target_pressure + 1e-8)
-    
-    return -contrast  # Minimize negative contrast
-
-
-def objective_uniform(lens_params, source, domain):
-    """
-    Create uniform pressure distribution within target area.
-    Loss = -(mean_pressure - 0.1 * pressure_variance)
-    """
-    field = compute_field(lens_params, source, domain)
-    field_on_grid = field.on_grid
-    
-    if field_on_grid.ndim == 3:
-        pressure_magnitude = jnp.abs(field_on_grid[..., 0])
-    else:
-        pressure_magnitude = jnp.abs(field_on_grid)
-    
-    # Create target area mask
-    target_mask = create_circular_mask(
-        center_x_mm=GRID_SIZE_MM[0]/2,
-        center_z_mm=FOCAL_DISTANCE_MM,
-        radius_mm=TARGET_RADIUS_MM
-    )
-    
-    # Convert to float for JAX
-    target_mask_float = target_mask.astype(jnp.float32)
-    
-    # Calculate mean using weighted sum
-    target_sum = jnp.sum(pressure_magnitude * target_mask_float)
-    target_count = jnp.sum(target_mask_float)
+    # Calculate mean pressure in target area
+    target_sum = jnp.sum(pressure_magnitude * target_mask)
+    target_count = jnp.sum(target_mask)
     mean_pressure = target_sum / (target_count + 1e-8)
     
-    # Calculate variance
-    squared_diff = (pressure_magnitude - mean_pressure) ** 2
-    variance_sum = jnp.sum(squared_diff * target_mask_float)
-    pressure_variance = variance_sum / (target_count + 1e-8)
-    
-    # Maximize mean while minimizing variance
-    return -(mean_pressure - 0.1 * pressure_variance)
+    return -mean_pressure
 
-
-def objective_sidelobe(lens_params, source, domain):
+def objective_area_contrast(optimization_params, source, domain):
     """
-    Maximize pressure in target area while suppressing sidelobes.
-    Loss = -(target_pressure - 0.3 * sidelobe_pressure)
+    Objective function: maximize contrast between target area and non-target area.
+    Contrast = mean_pressure_in_target / mean_pressure_outside_target
     """
-    field = compute_field(lens_params, source, domain)
+    field = compute_field(optimization_params, source, domain)
     field_on_grid = field.on_grid
     
     if field_on_grid.ndim == 3:
@@ -325,7 +280,79 @@ def objective_sidelobe(lens_params, source, domain):
     else:
         pressure_magnitude = jnp.abs(field_on_grid)
     
-    # Create masks
+    # Create target area mask
+    target_mask = create_circular_mask(
+        center_x_mm=GRID_SIZE_MM[0]/2,
+        center_z_mm=FOCAL_DISTANCE_MM,
+        radius_mm=TARGET_RADIUS_MM
+    )
+    
+    # Calculate mean pressure in target area
+    target_mask_float = target_mask.astype(jnp.float32)
+    target_sum = jnp.sum(pressure_magnitude * target_mask_float)
+    target_count = jnp.sum(target_mask_float)
+    mean_target_pressure = target_sum / (target_count + 1e-8)
+    
+    # Calculate mean pressure outside target area
+    non_target_mask_float = 1.0 - target_mask_float
+    non_target_sum = jnp.sum(pressure_magnitude * non_target_mask_float)
+    non_target_count = jnp.sum(non_target_mask_float)
+    mean_non_target_pressure = non_target_sum / (non_target_count + 1e-8)
+    
+    # Maximize contrast (minimize negative contrast)
+    contrast = mean_target_pressure / (mean_non_target_pressure + 1e-8)
+    return -contrast
+
+
+def objective_uniform(optimization_params, source, domain):
+    """
+    Objective function: maximize uniformity within target area.
+    Minimize variance while maximizing mean pressure.
+    """
+    field = compute_field(optimization_params, source, domain)
+    field_on_grid = field.on_grid
+    
+    if field_on_grid.ndim == 3:
+        pressure_magnitude = jnp.abs(field_on_grid[..., 0])
+    else:
+        pressure_magnitude = jnp.abs(field_on_grid)
+    
+    # Create target area mask
+    target_mask = create_circular_mask(
+        center_x_mm=GRID_SIZE_MM[0]/2,
+        center_z_mm=FOCAL_DISTANCE_MM,
+        radius_mm=TARGET_RADIUS_MM
+    )
+    
+    # Calculate mean and variance in target area
+    target_mask_float = target_mask.astype(jnp.float32)
+    target_sum = jnp.sum(pressure_magnitude * target_mask_float)
+    target_count = jnp.sum(target_mask_float)
+    mean_target_pressure = target_sum / (target_count + 1e-8)
+    
+    # Calculate variance
+    squared_diff = (pressure_magnitude - mean_target_pressure) ** 2
+    variance_sum = jnp.sum(squared_diff * target_mask_float)
+    variance = variance_sum / (target_count + 1e-8)
+    
+    # Objective: maximize mean pressure while minimizing variance
+    # Use a weighted combination
+    return -(mean_target_pressure - 0.1 * variance)
+
+
+def objective_sidelobe(optimization_params, source, domain):
+    """
+    Objective function: maximize pressure in target area while suppressing sidelobes.
+    """
+    field = compute_field(optimization_params, source, domain)
+    field_on_grid = field.on_grid
+    
+    if field_on_grid.ndim == 3:
+        pressure_magnitude = jnp.abs(field_on_grid[..., 0])
+    else:
+        pressure_magnitude = jnp.abs(field_on_grid)
+    
+    # Create masks for target area and sidelobe region
     target_mask = create_circular_mask(
         center_x_mm=GRID_SIZE_MM[0]/2,
         center_z_mm=FOCAL_DISTANCE_MM,
@@ -338,22 +365,23 @@ def objective_sidelobe(lens_params, source, domain):
         radius_mm=SIDELOBE_RADIUS_MM
     )
     
-    # Convert to float and create sidelobe mask
+    # Sidelobe mask is the region between target and sidelobe radius
     target_mask_float = target_mask.astype(jnp.float32)
     sidelobe_region_float = sidelobe_region.astype(jnp.float32)
-    sidelobe_mask_float = sidelobe_region_float - target_mask_float  # Annular region
+    sidelobe_mask_float = sidelobe_region_float - target_mask_float
     
-    # Calculate mean pressures
+    # Calculate mean pressure in target area
     target_sum = jnp.sum(pressure_magnitude * target_mask_float)
     target_count = jnp.sum(target_mask_float)
-    target_pressure = target_sum / (target_count + 1e-8)
+    mean_target_pressure = target_sum / (target_count + 1e-8)
     
+    # Calculate mean pressure in sidelobe region
     sidelobe_sum = jnp.sum(pressure_magnitude * sidelobe_mask_float)
     sidelobe_count = jnp.sum(sidelobe_mask_float)
-    sidelobe_pressure = sidelobe_sum / (sidelobe_count + 1e-8)
+    mean_sidelobe_pressure = sidelobe_sum / (sidelobe_count + 1e-8)
     
-    # Weighted objective
-    return -(target_pressure - 0.3 * sidelobe_pressure)
+    # Maximize target pressure while minimizing sidelobe pressure
+    return -(mean_target_pressure - 0.5 * mean_sidelobe_pressure)
 
 
 # 4. OPTIMIZATION
@@ -372,6 +400,9 @@ def main():
     if OBJECTIVE_TYPE == "point":
         objective_fn = objective
         print("Using point-based objective")
+    elif OBJECTIVE_TYPE == "focal_area":
+        objective_fn = objective_focal_area
+        print(f"Using focal area objective (target radius: {TARGET_RADIUS_MM} mm)")
     elif OBJECTIVE_TYPE == "area_contrast":
         objective_fn = objective_area_contrast
         print(f"Using area contrast objective (target radius: {TARGET_RADIUS_MM} mm)")
@@ -403,21 +434,25 @@ def main():
     plt.close()
     print("  -> Saved bowl source visualization to /workspace/hologram/outs/bowl_source.png")
     
-    # Initialize the lens parameters. One parameter per vertical slice of the lens.
-    # Three stackable lenses, each with lens_width_vox parameters
+    # Initialize the optimization parameters
+    opt_width_vox = int(OPTIMIZATION_WIDTH_MM / dx_mm)
+    opt_thickness_vox = int(OPTIMIZATION_THICKNESS_MM / dx_mm)
+    total_opt_voxels = opt_width_vox * opt_thickness_vox
     
-    lens_width_vox = int(LENS_WIDTH_MM / dx_mm)
-    initial_lens_params = jnp.zeros(lens_width_vox * 3)
+    # Initialize with zeros (neutral starting point for continuous optimization)
+    # This corresponds to the center of the sound speed range after tanh transformation
+    initial_opt_params = jnp.zeros(total_opt_voxels)
     
-    print(f"Lens region width: {LENS_WIDTH_MM} mm ({lens_width_vox} optimizable parameters)")
+    print(f"Optimization region: {OPTIMIZATION_WIDTH_MM} mm x {OPTIMIZATION_THICKNESS_MM} mm")
+    print(f"Optimization voxels: {opt_width_vox} x {opt_thickness_vox} = {total_opt_voxels} parameters")
 
     # Set up the Adam optimizer
     learning_rate = 0.1
     init_fun, update_fun, get_params = optimizers.adam(learning_rate)
-    opt_state = init_fun(initial_lens_params)
+    opt_state = init_fun(initial_opt_params)
     
     # Create the function that computes both the loss and the gradient
-    # The `argnums=0` specifies that we want to differentiate with respect to the first argument (`lens_params`)
+    # The `argnums=0` specifies that we want to differentiate with respect to the first argument
     objective_and_grad = value_and_grad(objective_fn, argnums=0)
     
     # JIT-compile the optimization step for speed
@@ -439,9 +474,9 @@ def main():
     pressure_history = []
     
     # Create a function to visualize and save the pressure field
-    def save_pressure_field(lens_params, iteration, vmin=None, vmax=None):
-        """Compute and save the pressure field for the current lens parameters."""
-        field = compute_field(lens_params, bowl_source, domain)
+    def save_pressure_field(opt_params, iteration, vmin=None, vmax=None):
+        """Compute and save the pressure field for the current optimization parameters."""
+        field = compute_field(opt_params, bowl_source, domain)
         field_on_grid = field.on_grid
         
         # Extract the magnitude of the pressure field
@@ -455,11 +490,15 @@ def main():
         target_z_vox = int(FOCAL_DISTANCE_MM / dx_mm)
         target_pressure = pressure_magnitude[target_x_vox, target_z_vox]
         
+        # Initialize metric values
+        metric_value = target_pressure
+        metric_label = f"Target Point Pressure: {metric_value:.3f}"
+        
         # Calculate relevant metrics based on objective type
         if OBJECTIVE_TYPE == "point":
-            metric_value = target_pressure
-            metric_label = f"Target Point Pressure: {metric_value:.3f}"
-        elif OBJECTIVE_TYPE in ["area_contrast", "uniform", "sidelobe"]:
+            # Already set above
+            pass
+        elif OBJECTIVE_TYPE in ["area_contrast", "uniform", "sidelobe", "focal_area"]:
             # Calculate mean pressure in target area
             target_mask = create_circular_mask(
                 center_x_mm=GRID_SIZE_MM[0]/2,
@@ -473,7 +512,10 @@ def main():
             target_count = jnp.sum(target_mask_float)
             mean_target_pressure = target_sum / (target_count + 1e-8)
             
-            if OBJECTIVE_TYPE == "area_contrast":
+            if OBJECTIVE_TYPE == "focal_area":
+                metric_value = mean_target_pressure
+                metric_label = f"Target Mean: {mean_target_pressure:.3f}"
+            elif OBJECTIVE_TYPE == "area_contrast":
                 non_target_mask_float = 1.0 - target_mask_float
                 non_target_sum = jnp.sum(pressure_magnitude * non_target_mask_float)
                 non_target_count = jnp.sum(non_target_mask_float)
@@ -525,22 +567,21 @@ def main():
         # Add target point marker with pressure value
         target_x_mm = GRID_SIZE_MM[0] / 2
         target_z_mm = FOCAL_DISTANCE_MM
-        plt.plot(target_x_mm, target_z_mm, 'b*', markersize=10, 
-                label=metric_label)
+        plt.plot(target_x_mm, target_z_mm, 'b*', markersize=10, label=metric_label)
         
-        # Add lens region outline
-        lens_x_start_mm = (GRID_SIZE_MM[0] - LENS_WIDTH_MM) / 2
-        lens_x_end_mm = lens_x_start_mm + LENS_WIDTH_MM
-        lens_z_start_mm = LENS_START_Z_MM
-        lens_z_end_mm = lens_z_start_mm + LENS_THICKNESS_MM
+        # Add optimization region outline
+        opt_x_start_mm = (GRID_SIZE_MM[0] - OPTIMIZATION_WIDTH_MM) / 2
+        opt_x_end_mm = opt_x_start_mm + OPTIMIZATION_WIDTH_MM
+        opt_z_start_mm = OPTIMIZATION_START_Z_MM
+        opt_z_end_mm = opt_z_start_mm + OPTIMIZATION_THICKNESS_MM
         
-        # Draw lens rectangle
+        # Draw optimization region rectangle
         from matplotlib.patches import Rectangle
-        lens_rect = Rectangle((lens_x_start_mm, lens_z_start_mm), 
-                            LENS_WIDTH_MM, LENS_THICKNESS_MM,
+        opt_rect = Rectangle((opt_x_start_mm, opt_z_start_mm), 
+                            OPTIMIZATION_WIDTH_MM, OPTIMIZATION_THICKNESS_MM,
                             linewidth=2, edgecolor='white', facecolor='none',
-                            linestyle='--', label='Lens Region')
-        plt.gca().add_patch(lens_rect)
+                            linestyle='-', label='Optimization Region')
+        plt.gca().add_patch(opt_rect)
         
         # Add natural focal point of bowl
         natural_focus_z = BOWL_ROC_MM
@@ -648,7 +689,7 @@ def main():
     print(f"Change: {pressure_history[-1] - pressure_history[0]:.4f} ({(pressure_history[-1]/pressure_history[0] - 1)*100:.1f}%)")
     
     # You can now use `optimized_params` to generate the final sound speed map
-    final_sos_map = create_optimizable_sos_map(optimized_params, domain)
+    final_sos_map = create_sos_map(optimized_params, domain)
     print("\nAn object `final_sos_map` containing the optimized sound speed distribution has been created.")
     # In a real application, you would save or visualize this map.
     # For example:
@@ -662,21 +703,21 @@ def main():
     plt.xlabel('X (mm)')
     plt.ylabel('Z (mm)')
     
-    # Add lens region outline
-    lens_x_start_mm = (GRID_SIZE_MM[0] - LENS_WIDTH_MM) / 2
+    # Add optimization region outline
+    opt_x_start_mm = (GRID_SIZE_MM[0] - OPTIMIZATION_WIDTH_MM) / 2
     from matplotlib.patches import Rectangle
-    lens_rect = Rectangle((lens_x_start_mm, LENS_START_Z_MM), 
-                        LENS_WIDTH_MM, LENS_THICKNESS_MM,
+    opt_rect = Rectangle((opt_x_start_mm, OPTIMIZATION_START_Z_MM), 
+                        OPTIMIZATION_WIDTH_MM, OPTIMIZATION_THICKNESS_MM,
                         linewidth=2, edgecolor='red', facecolor='none',
-                        linestyle='--', label='Lens Region')
-    plt.gca().add_patch(lens_rect)
+                        linestyle='--', label='Optimization Region')
+    plt.gca().add_patch(opt_rect)
     
     plt.savefig(f'{OUTPUT_DIR}/optimized_sos_map.png', dpi=300, bbox_inches='tight')
     plt.close()
     print("  -> Saved optimized sound speed map to /workspace/hologram/outs/optimized_sos_map.png")
     
     # Also save initial sound speed map for comparison
-    initial_sos_map = create_optimizable_sos_map(initial_params, domain)
+    initial_sos_map = create_sos_map(initial_params, domain)
     plt.figure(figsize=(10, 6))
     sos_on_grid = initial_sos_map.on_grid[..., 0]
     im = plt.imshow(sos_on_grid.T, cmap='viridis', 
@@ -687,11 +728,11 @@ def main():
     plt.xlabel('X (mm)')
     plt.ylabel('Z (mm)')
     
-    lens_rect = Rectangle((lens_x_start_mm, LENS_START_Z_MM), 
-                        LENS_WIDTH_MM, LENS_THICKNESS_MM,
+    opt_rect = Rectangle((opt_x_start_mm, OPTIMIZATION_START_Z_MM), 
+                        OPTIMIZATION_WIDTH_MM, OPTIMIZATION_THICKNESS_MM,
                         linewidth=2, edgecolor='red', facecolor='none',
-                        linestyle='--', label='Lens Region')
-    plt.gca().add_patch(lens_rect)
+                        linestyle='--', label='Optimization Region')
+    plt.gca().add_patch(opt_rect)
     
     plt.savefig(f'{OUTPUT_DIR}/initial_sos_map.png', dpi=300, bbox_inches='tight')
     plt.close()
