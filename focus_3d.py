@@ -46,22 +46,22 @@ SOUND_SPEED_WATER  = DTYPE(1500.0)
 SOUND_SPEED_SIL    = DTYPE(1600.0) # https://chatgpt.com/share/68637b75-c3dc-8000-ba17-326069cef557
 OMEGA              = DTYPE(2 * np.pi * FREQ_HZ)
 
-BOWL_DIAM_MM, BOWL_ROC_MM = 20, 23.0
-FOCAL_DISTANCE_MM, TARGET_RADIUS_MM = 20.0, 0.5
+BOWL_DIAM_MM, BOWL_ROC_MM = 50, 50.0
+FOCAL_DISTANCE_MM, TARGET_RADIUS_MM = 50.0, 0.5
 SIDELOBE_RADIUS_MM = 3.0  # Region to suppress sidelobes
 
-NUM_LENSES            = 4
-LENS_WIDTH_MM         = 20.0
-LENS_THICKNESS_MM     = 0.5
-BACKING_THICKNESS_MM  = 1.0
+NUM_LENSES            = 10
+LENS_WIDTH_MM         = 50.0
+LENS_THICKNESS_MM     = 0.3
+BACKING_THICKNESS_MM  = 0.5
 GAP_BETWEEN_LENSES_MM = 0.01
-LENS_START_Z_MM       = 3.0
+LENS_START_Z_MM       = 3.5
 
 VOXEL_SIZE_MM = 0.4          # controllable resolution in the optimisable layer
 DX_MM         = 0.2          # global grid spacing (coarser to save memory)
 DX_M          = DTYPE(DX_MM / 1e3)
 
-GRID_SIZE_MM = (20, 20, 35)
+GRID_SIZE_MM = (50, 50, 65)
 N = tuple(int(d / DX_MM) for d in GRID_SIZE_MM)
 
 domain = Domain(N, tuple([DX_M] * 3))
@@ -85,6 +85,11 @@ lens_start_z_vox    = int(LENS_START_Z_MM / DX_MM)
 #  SIDELOBE SUPPRESSION PARAMETERS
 # ---------------------------------------------------------------------------
 SIDELOBE_PENALTY = 0.5
+
+# ---------------------------------------------------------------------------
+#  VISUALISATION PARAMETERS
+# ---------------------------------------------------------------------------
+VMAX = 1.0
 
 # ---------------------------------------------------------------------------
 #  SOURCE (bowl transducer)
@@ -237,27 +242,38 @@ def objective_sidelobe(lens_params: jnp.ndarray):
     
     return -(target_pressure - SIDELOBE_PENALTY * sidelobe_pressure)
 
+# ---------------------------------------------------------------------------
+#  OBJECTIVE SHAPE
+def objective_shape(params, amp_target=1.50, alpha=3.0):
+    field = compute_field(params).on_grid
+    amp   = jnp.abs(field[...,0])
+    target_mask = create_spherical_mask_vectorized(
+        GRID_SIZE_MM[0]/2, GRID_SIZE_MM[1]/2, FOCAL_DISTANCE_MM, TARGET_RADIUS_MM
+    ).astype(DTYPE)
+    L_in  = jnp.mean((amp - amp_target)**2 * target_mask)
+    L_out = jnp.mean(amp**2 * (1 - target_mask))
+    # optional: push sigmoid outputs towards {0,1} for binary printability
+    #bin_reg = 1e-3 * jnp.mean(jax.nn.sigmoid(params)*(1-jax.nn.sigmoid(params)))
+    return L_in + alpha*L_out #+ bin_reg
+
+# ---------------------------------------------------------------------------
+
 objective_sidelobe_and_grad = jit(value_and_grad(objective_sidelobe))
+objective_shape_and_grad = jit(value_and_grad(objective_shape))
 
 # ---------------------------------------------------------------------------
 #  OPTIMISER
 # ---------------------------------------------------------------------------
 # Choose objective function
-USE_SIDELOBE_OBJECTIVE = True  # Set to False for standard objective
 
-learning_rate = 0.1
+learning_rate = 0.3
 optimiser     = optax.adamw(learning_rate)
 total_params  = NUM_LENSES * TOTAL_VOXELS_PER_LENS
 params        = 0.2 * (random.uniform(key, (total_params,), dtype=DTYPE) - 0.5)
 opt_state     = optimiser.init(params)
 
 # Select objective function
-if USE_SIDELOBE_OBJECTIVE:
-    selected_objective_and_grad = objective_sidelobe_and_grad
-    print("Using sidelobe suppression objective")
-else:
-    selected_objective_and_grad = objective_and_grad
-    print("Using standard objective")
+selected_objective_and_grad = objective_sidelobe_and_grad
 
 @jit
 def optimisation_step(params, opt_state):
@@ -287,65 +303,133 @@ def _save_bowl_source_xz(save_path: str):
     plt.tight_layout(); plt.savefig(save_path, dpi=200); plt.close()
     print("Saved:", save_path)
 
+def _save_pressure_xz(lens_params, tag):                   # << MOD >>
+    """
+    Save an X‑Z slice of |p|.
+    `tag` can be an int (iteration index) or a string such as “no_lens”.
+    """
+    y_mid   = N[1] // 2
+    field   = compute_field(lens_params).on_grid
+    press   = np.abs(np.asarray(field[..., 0] if field.ndim == 4 else field))
 
-def _save_pressure_xz(lens_params, iter_idx: int):
-    """XZ slice of pressure + green dotted boxes around optimisable layers."""
-    y_mid    = N[1] // 2
-    field    = compute_field(lens_params).on_grid
-    press    = np.abs(np.asarray(field[..., 0] if field.ndim==4 else field))
+    if isinstance(tag, int):
+        fname = f"{OUTDIR}/pressure_iter_{tag:03d}.png"
+        title = f"|p| after iter {tag:03d}"
+    else:
+        fname = f"{OUTDIR}/pressure_{tag}.png"
+        title = f"|p| – {tag}"
 
-    fname = f"{OUTDIR}/pressure_iter_{iter_idx:03d}.png"
-    fig, ax = plt.subplots(figsize=(7,4))
+    fig, ax = plt.subplots(figsize=(7, 4))
     im = ax.imshow(press[:, y_mid, :].T,
                    extent=[0, GRID_SIZE_MM[0], GRID_SIZE_MM[2], 0],
-                   cmap='hot', aspect='auto', origin='upper')
-    ax.set_title(f"|p| after iter {iter_idx}  (XZ slice, y=mid)")
+                   cmap='hot', aspect='auto', origin='upper', vmin=0, vmax=VMAX)
+    ax.set_title(title + "  (XZ slice, y = mid)")
     ax.set_xlabel("x [mm]"); ax.set_ylabel("z [mm]")
     fig.colorbar(im, ax=ax, label='|p|')
 
-    # ── green dotted boxes around differentiable (optimisable) layers ──
+    # green dotted boxes .....................................................
     x0_mm = lens_xy_start_vox * DX_MM
     w_mm  = lens_width_vox     * DX_MM
     for i in range(NUM_LENSES):
-        z0_vox = lens_start_z_vox + i*(lens_thickness_vox + backing_vox + gap_vox)
+        z0_vox = lens_start_z_vox + i * (lens_thickness_vox + backing_vox + gap_vox)
         z1_vox = z0_vox + lens_thickness_vox
-        z0_mm  = z0_vox * DX_MM
-        h_mm   = lens_thickness_vox * DX_MM
-
-        rect = Rectangle((x0_mm, z0_mm),               # (x,z) origin in mm
-                         width=w_mm, height=h_mm,
-                         linewidth=1.2, edgecolor='lime',
-                         linestyle=':', fill=False)
+        rect   = Rectangle((x0_mm, z0_vox * DX_MM),
+                           width=w_mm, height=lens_thickness_vox * DX_MM,
+                           linewidth=1.2, edgecolor='lime', linestyle=':', fill=False)
         ax.add_patch(rect)
 
-    # ── green cross at target location ──
-    target_x_mm = GRID_SIZE_MM[0] / 2
-    target_z_mm = FOCAL_DISTANCE_MM
-    ax.plot(target_x_mm, target_z_mm, 'gx', markersize=10, markeredgewidth=2, 
-            label=f'Target ({target_x_mm:.1f}, {target_z_mm:.1f})')
-    ax.legend(loc='upper right')
-
+    ax.plot(GRID_SIZE_MM[0]/2, FOCAL_DISTANCE_MM, 'gx', ms=10, mew=2)
     plt.tight_layout(); plt.savefig(fname, dpi=200); plt.close()
     print("Saved:", fname)
 
 # ---------------------------------------------------------------------------
+#  SOS‑HISTOGRAM HELPER       << NEW >>
+# ---------------------------------------------------------------------------
+def _save_sos_hist(lens_params, iter_idx):
+    """Save a histogram of the sound‑speed voxels in the optimisable region."""
+    sos = np.asarray(params_to_sos(lens_params).on_grid[..., 0])
+
+    sos_opt = sos[
+        lens_xy_start_vox:lens_xy_start_vox + lens_width_vox,
+        lens_xy_start_vox:lens_xy_start_vox + lens_width_vox,
+        lens_start_z_vox:lens_start_z_vox +                       # full lens stack
+        NUM_LENSES * (lens_thickness_vox + backing_vox + gap_vox) - gap_vox
+    ].ravel()
+
+    plt.figure(figsize=(5, 4))
+    plt.hist(sos_opt, bins=50,
+             range=(float(SOUND_SPEED_WATER), float(SOUND_SPEED_SIL)))
+    plt.xlabel("Sound speed [m s⁻¹]"); plt.ylabel("Voxel count")
+    plt.title(f"sos distribution @ iter {iter_idx:03d}")
+    plt.tight_layout()
+    plt.savefig(f"{OUTDIR}/hist_iter_{iter_idx:03d}.png", dpi=200)
+    plt.close()
+    print("Saved histogram for iter", iter_idx)
+
+# ---------------------------------------------------------------------------
+#  PRESSURE‑METRIC HELPER     << NEW >>
+# ---------------------------------------------------------------------------
+def _target_pressure(lens_params):
+    """Return mean |p| in the target sphere (host‑side float)."""
+    field = compute_field(lens_params).on_grid
+    press = jnp.abs(field[..., 0] if field.ndim == 4 else field)
+
+    global target_mask
+    if target_mask is None:                       # create once, reuse later
+        x = jnp.arange(N[0]) * DX_MM
+        y = jnp.arange(N[1]) * DX_MM
+        z = jnp.arange(N[2]) * DX_MM
+        X, Y, Z = jnp.meshgrid(x, y, z, indexing='ij')
+        target_mask = (((X - GRID_SIZE_MM[0]/2)**2 +
+                        (Y - GRID_SIZE_MM[1]/2)**2 +
+                        (Z - FOCAL_DISTANCE_MM)**2) <= TARGET_RADIUS_MM**2).astype(DTYPE)
+    return float((press * target_mask).sum() / (target_mask.sum() + 1e-8))
+
+# ---------------------------------------------------------------------------
+#  BASELINE (all‑water, “no_lens”)         << NEW >>
+# ---------------------------------------------------------------------------
+BASELINE_PARAMS = jnp.full((total_params,), -10.0, dtype=DTYPE)   # sigmoid≈0 → water
+baseline_field  = compute_field(BASELINE_PARAMS).on_grid
+np.save(f"{OUTDIR}/pressure_no_lens.npy",
+        np.asarray(baseline_field[..., 0] if baseline_field.ndim == 4 else baseline_field,
+                   dtype=np.float32))
+_save_pressure_xz(BASELINE_PARAMS, "no_lens")
+print("Baseline simulation stored as 'no_lens'.")
+
+baseline_p = _target_pressure(BASELINE_PARAMS)
+
+# ---------------------------------------------------------------------------
 #  TRAINING LOOP
 # ---------------------------------------------------------------------------
+_save_bowl_source_xz(f"{OUTDIR}/bowl_source_xz.png")
 
-_save_bowl_source_xz(f"{OUTDIR}/bowl_source_xz.png")      #  << NEW >>
-N_ITERS, losses = 50, []
+N_ITERS          = 30
+losses           = []
+pressures        = []          # mean |p| in target each iter
 t0 = time.time()
+
 for i in range(N_ITERS):
     params, opt_state, loss = optimisation_step(params, opt_state)
     losses.append(float(loss))
 
-    if i % 5 == 0:
-        print(f"iter {i:02d} | loss {loss:10.6f}")
-        _save_pressure_xz(params, i)
+    # target pressure metric .................................................
+    p_now = _target_pressure(params)
+    pressures.append(p_now)
 
-print(f"\nFinished in {time.time() - t0:.1f} s")
-print(f"Initial loss {losses[0]:.4f} → final {losses[-1]:.4f} "
-      f"({(losses[0]-losses[-1])/abs(losses[0])*100:.1f} %)")
+    if i % 5 == 0:
+        # percent improvement vs 5 iters before (or baseline for i==0)
+        p_prev = baseline_p if i == 0 else pressures[i-5]
+        pct    = (p_now - p_prev) / abs(p_prev + 1e-12) * 100.0
+
+        print(f"iter {i:02d} | loss {loss:10.6f} | ⟨|p|⟩ {p_now:.5e}  "
+              f"(+{pct:+.1f}% vs {('baseline' if i==0 else f'iter {i-5:02d}')} )")
+
+        _save_pressure_xz(params, i)
+        _save_sos_hist(params, i)
+
+print(f"\nFinished in {time.time() - t0:.1f} s")
+overall_pct = (pressures[-1] - baseline_p) / abs(baseline_p) * 100.0
+print(f"Mean‑pressure improvement: +{overall_pct:.1f}%  (baseline → final)")
 
 # ---------------------------------------------------------------------------
 #  VISUALISATION & EXPORT  (unchanged except for dtype casts)
@@ -374,6 +458,7 @@ plt.tight_layout(); plt.savefig(f"{OUTDIR}/convergence.png", dpi=200); plt.close
 np.save(f"{OUTDIR}/optimised_params.npy", np.asarray(params, dtype=np.float32))
 with open(f"{OUTDIR}/run.json", "w") as fp:
     json.dump({
+        # Optimization info
         "n_iters": N_ITERS,
         "losses": losses,
         "time_sec": time.time() - t0,
@@ -381,7 +466,30 @@ with open(f"{OUTDIR}/run.json", "w") as fp:
         "dtype": "float32/bfloat16",
         "objective": "sidelobe_suppression" if USE_SIDELOBE_OBJECTIVE else "standard",
         "sidelobe_radius_mm": SIDELOBE_RADIUS_MM if USE_SIDELOBE_OBJECTIVE else None,
-        "sidelobe_weight": 0.3 if USE_SIDELOBE_OBJECTIVE else None
+        "sidelobe_penalty": SIDELOBE_PENALTY if USE_SIDELOBE_OBJECTIVE else None,
+        
+        # Physical parameters - essential for reconstruction
+        "physical_params": {
+            "num_lenses": NUM_LENSES,
+            "lens_width_mm": LENS_WIDTH_MM,
+            "lens_thickness_mm": LENS_THICKNESS_MM,
+            "backing_thickness_mm": BACKING_THICKNESS_MM,
+            "gap_between_lenses_mm": GAP_BETWEEN_LENSES_MM,
+            "lens_start_z_mm": LENS_START_Z_MM,
+            "voxel_size_mm": VOXEL_SIZE_MM,
+            "num_xy_segments": NUM_XY_SEGMENTS,
+            "total_voxels_per_lens": TOTAL_VOXELS_PER_LENS,
+            "total_params": total_params,
+            "dx_mm": DX_MM,
+            "grid_size_mm": GRID_SIZE_MM,
+            "freq_hz": FREQ_HZ,
+            "sound_speed_water": float(SOUND_SPEED_WATER),
+            "sound_speed_sil": float(SOUND_SPEED_SIL),
+            "bowl_diam_mm": BOWL_DIAM_MM,
+            "bowl_roc_mm": BOWL_ROC_MM,
+            "focal_distance_mm": FOCAL_DISTANCE_MM,
+            "target_radius_mm": TARGET_RADIUS_MM
+        }
     }, fp, indent=2)
 
 print("All artefacts stored in:", OUTDIR)
