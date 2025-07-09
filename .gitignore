@@ -5,3 +5,4 @@
 __pycache__/
 /codegen
 /exported_lenses
+/test

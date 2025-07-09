@@ -31,8 +31,8 @@ pip install -U \
   "jax[cuda12]==${JAX_VERSION}" \
   -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
-echo ">>> Installing JWAVE"
-pip install jwave
+echo ">>> Installing JWAVE and dependencies"
+pip install jwave optax matplotlib
 
 echo ">>> Verifying GPU is visible to JAX"
 python - <<'PY'

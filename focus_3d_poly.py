@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fast 3‑D stacked‑lens optimiser for Formlabs‑printable acoustic devices.
+Fast 3-D stacked-lens optimiser for PolyJet lenses (Agilus30 ↔ VeroClear mix).
+
+Major additions
+---------------
+1. Material speeds from Bakaric et al. (2021) integrated.
+2. params_to_sos() now mixes Agilus30 (0) → VeroClear (1).
+3. Attenuation hooks left blank – JWAVE Helmholtz is loss-less.
 
 Key changes vs. the reference implementation
 --------------------------------------------
@@ -14,6 +20,8 @@ Key changes vs. the reference implementation
 import os, time, json
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
+from jax import custom_vjp
 
 import jax, jax.numpy as jnp
 from jax import random, value_and_grad, jit
@@ -24,6 +32,25 @@ from jwave import FourierSeries
 from jwave.geometry import Domain, Medium
 from jwave.acoustics.time_harmonic import helmholtz_solver
 
+# Import adjoint utilities
+from adjoint_utils import solve_adjoint
+
+# ---------------------------------------------------------------------------
+#  ARGUMENT PARSER
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description='Optimize acoustic lenses for focused ultrasound')
+parser.add_argument('--freq-hz', type=float, default=1.5e6,
+                    help='Frequency in Hz (default: 1.5e6)')
+parser.add_argument('--bowl-diam-mm', type=float, default=25.0,
+                    help='Bowl diameter in mm (default: 25.0)')
+parser.add_argument('--bowl-roc-mm', type=float, default=30.0,
+                    help='Bowl radius of curvature in mm (default: 30.0)')
+parser.add_argument('--focal-distance-mm', type=float, default=None,
+                    help='Focal distance in mm (default: BOWL_ROC_MM * 1.08)')
+parser.add_argument('--num-lenses', type=int, default=5,
+                    help='Number of lenses in the stack (default: 5)')
+args = parser.parse_args()
+
 # ---------------------------------------------------------------------------
 #  JAX & mixed‑precision set‑up
 # ---------------------------------------------------------------------------
@@ -33,36 +60,49 @@ CDTYPE = jnp.complex64        # complex for frequency‑domain fields
 key    = random.PRNGKey(42)
 
 # ---------------------------------------------------------------------------
-#  OUTPUT DIRECTORY
-# ---------------------------------------------------------------------------
-OUTDIR = f"/workspace/hologram/outs/stacked_3d_{time.strftime('%Y%m%d_%H%M%S')}"
-os.makedirs(OUTDIR, exist_ok=True)
-
-# ---------------------------------------------------------------------------
 #  PHYSICAL & GEOMETRICAL CONSTANTS
 # ---------------------------------------------------------------------------
-FREQ_HZ            = 0.5e6
-SOUND_SPEED_WATER  = DTYPE(1500.0)
-SOUND_SPEED_SIL    = DTYPE(1600.0) # https://chatgpt.com/share/68637b75-c3dc-8000-ba17-326069cef557
+FREQ_HZ            = args.freq_hz
+FREQ_MHZ           = FREQ_HZ / 1e6
+
+# ---------------------------------------------------------------------------
+#  OUTPUT DIRECTORY
+# ---------------------------------------------------------------------------
+# Include transducer parameters in directory name
+BOWL_DIAM_MM = args.bowl_diam_mm
+BOWL_ROC_MM = args.bowl_roc_mm
+NUM_LENSES = args.num_lenses
+transducer_spec = f"OD{int(BOWL_DIAM_MM)}_F{FREQ_MHZ:.1f}MHz_R{int(BOWL_ROC_MM)}_L{NUM_LENSES}"
+OUTDIR = f"/workspace/hologram/test/stacked_3d_poly_{transducer_spec}_{time.strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(OUTDIR, exist_ok=True)
 OMEGA              = DTYPE(2 * np.pi * FREQ_HZ)
 
-BOWL_DIAM_MM, BOWL_ROC_MM = 25, 30.0
-FOCAL_DISTANCE_MM, TARGET_RADIUS_MM = 27.0, 0.5
+# <<< NEW >>> PolyJet materials from Bakaric et al. (2021)
+SOUND_SPEED_WATER  = DTYPE(1500.0)
+SOS_AGILUS         = DTYPE(2035.0)   # Agilus30 group velocity at 2 MHz
+SOS_VEROCLR        = DTYPE(2473.0)   # VeroClear group velocity at 2 MHz
+
+# Power-law attenuation coefficients (not used by solver yet)
+AGILUS_A0_DB       = 9.109           # dB·MHz^(-y)·cm^(-1)
+AGILUS_Y           = 1.017
+VERO_A0_DB         = 3.696           # dB·MHz^(-y)·cm^(-1)
+VERO_Y             = 0.9958
+
+FOCAL_DISTANCE_MM = args.focal_distance_mm if args.focal_distance_mm is not None else BOWL_ROC_MM * 1.08
+TARGET_RADIUS_MM = 0.5
 SIDELOBE_RADIUS_MM = 4.0  # Region to suppress sidelobes
 
-NUM_LENSES            = 5 
-LENS_WIDTH_MM         = 25.0
+LENS_WIDTH_MM         = BOWL_DIAM_MM
 LENS_THICKNESS_MM     = 0.5  # Must be >= DX_MM for at least 1 voxel thickness
 BACKING_THICKNESS_MM  = 0.5
 GAP_BETWEEN_LENSES_MM = 0.5  # Also increased to be >= DX_MM
-LENS_START_Z_MM       = 4.5
 
-PPW = 3
+PPW = 6
 VOXEL_SIZE_MM = 0.5          # Must be >= DX_MM for proper discretization
 DX_MM         =  min(0.125, (1500/FREQ_HZ/PPW)*1e3)           # global grid spacing (coarser to save memory)
 DX_M          = DTYPE(DX_MM / 1e3)
 
-GRID_SIZE_MM = (25, 25, 40)
+GRID_SIZE_MM = (BOWL_DIAM_MM, BOWL_DIAM_MM, BOWL_ROC_MM*1.2)
 N = tuple(int(d / DX_MM) for d in GRID_SIZE_MM)
 
 domain = Domain(N, tuple([DX_M] * 3))
@@ -80,7 +120,6 @@ lens_width_vox      = NUM_XY_SEGMENTS * voxel_size_in_grid
 lens_thickness_vox  = int(LENS_THICKNESS_MM / DX_MM)
 backing_vox         = int(BACKING_THICKNESS_MM / DX_MM)
 gap_vox             = int(GAP_BETWEEN_LENSES_MM / DX_MM)
-lens_start_z_vox    = int(LENS_START_Z_MM / DX_MM)
 
 # ---------------------------------------------------------------------------
 #  SIDELOBE SUPPRESSION PARAMETERS
@@ -117,16 +156,29 @@ def create_bowl_source_3d() -> FourierSeries:
     zeros_complex  = jnp.zeros_like(field_complex)               # same dtype
 
     src = jnp.where(mask, field_complex, zeros_complex)          # complex64
-    return FourierSeries(src[..., None], domain)
+    return FourierSeries(src[..., None], domain), mask
 
-bowl_source = create_bowl_source_3d()
+bowl_source, bowl_mask = create_bowl_source_3d()
+
+# Find the maximum Z voxel index where bowl exists
+z_indices = jnp.arange(N[2])
+max_z_vox = int(jnp.max(jnp.where(bowl_mask.any(axis=(0, 1)), z_indices, 0)))
+MAX_BOWL_Z_MM = max_z_vox * DX_MM
+
+# Set lens start position to be 1mm above the highest point of the bowl
+LENS_START_Z_MM = MAX_BOWL_Z_MM + 1.0
+lens_start_z_vox = int(LENS_START_Z_MM / DX_MM)
+print(f"Bowl highest Z: {MAX_BOWL_Z_MM:.2f} mm, Lens starts at Z: {LENS_START_Z_MM:.2f} mm")
 
 # ---------------------------------------------------------------------------
-#  VECTORISED PARAMS → SOUND‑SPEED FIELD
+#  VECTORISED PARAMS → SOUND‑SPEED FIELD  <<< MODIFIED >>>
 # ---------------------------------------------------------------------------
 @jit
 def params_to_sos(lens_params: jnp.ndarray) -> FourierSeries:
-    """Convert flat parameter vector to a Fourier‑series sound‑speed field."""
+    """Convert flat parameter vector to a Fourier‑series sound‑speed field.
+    
+    matfrac = 0 → Agilus30;  matfrac = 1 → VeroClear.
+    """
     # (ℓ, segX, segY) in [0,1] after sigmoid
     matfrac = jax.nn.sigmoid(
         lens_params.reshape(NUM_LENSES, NUM_XY_SEGMENTS, NUM_XY_SEGMENTS)
@@ -137,9 +189,10 @@ def params_to_sos(lens_params: jnp.ndarray) -> FourierSeries:
                          voxel_size_in_grid, 2)          # (ℓ, X, Y)
 
     # Build optimisable + backing layers for each lens
+    # <<< NEW >>> Both optimizable and backing regions use material fraction
     opt_layer  = jnp.repeat(matfrac[..., None], lens_thickness_vox, -1)
-    backing    = jnp.ones_like(opt_layer[..., :backing_vox])
-    lens_block = jnp.concatenate([opt_layer, backing], -1)      # silicone=1
+    backing    = jnp.ones_like(opt_layer[..., :backing_vox])  # Keep as 1 (VeroClear) for backing
+    lens_block = jnp.concatenate([opt_layer, backing], -1)
 
     gap_block  = jnp.zeros_like(opt_layer[..., :gap_vox])       # water gap
 
@@ -151,13 +204,18 @@ def params_to_sos(lens_params: jnp.ndarray) -> FourierSeries:
             blocks.append(gap_block[idx])                       # same XY size
     stack = jnp.concatenate(blocks, -1)                         # (X,Y,Z_lens)
 
-    # Embed in global grid
+    # <<< NEW >>> Linear mixing of sound speeds
+    # Embed in global grid with material mixing
     sos = jnp.ones(N, dtype=DTYPE) * SOUND_SPEED_WATER
+    
+    # Calculate mixed sound speed for the lens region
+    sos_lens = SOS_AGILUS + stack * (SOS_VEROCLR - SOS_AGILUS)
+    
     sos = sos.at[
         lens_xy_start_vox:lens_xy_start_vox + lens_width_vox,
         lens_xy_start_vox:lens_xy_start_vox + lens_width_vox,
         lens_start_z_vox:lens_start_z_vox + stack.shape[-1],
-    ].set((SOUND_SPEED_SIL - SOUND_SPEED_WATER) * stack + SOUND_SPEED_WATER)
+    ].set(sos_lens)
 
     return FourierSeries(sos[..., None], domain)
 
@@ -169,6 +227,12 @@ def compute_field(lens_params: jnp.ndarray):
     medium = Medium(domain=domain,
                     sound_speed=params_to_sos(lens_params),
                     pml_size=10)
+    # NOTE: JWAVE currently does not support attenuation in frequency domain
+    # Solves for pressure field X using gmres solver
+    # H X = bowl_source
+    # H = Helmholtz operator
+    # X = pressure field
+    # bowl_source = complex pressure distribution on the transducer surface
     return helmholtz_solver(medium, OMEGA, bowl_source,
                             tol=1e-3, checkpoint=True)        # Enable gradient checkpointing
 
@@ -217,7 +281,7 @@ def create_spherical_mask_vectorized(center_x_mm, center_y_mm, center_z_mm, radi
 # ---------------------------------------------------------------------------
 #  SIDELOBE SUPPRESSION OBJECTIVE
 # ---------------------------------------------------------------------------
-@jit
+@custom_vjp
 def objective_sidelobe(lens_params: jnp.ndarray):
     """Maximize pressure in target area while suppressing sidelobes."""
     field = compute_field(lens_params).on_grid
@@ -242,8 +306,123 @@ def objective_sidelobe(lens_params: jnp.ndarray):
     target_pressure = jnp.sum(pressure_magnitude * target_mask) / (jnp.sum(target_mask) + 1e-8)
     sidelobe_pressure = jnp.sum(pressure_magnitude * sidelobe_mask) / (jnp.sum(sidelobe_mask) + 1e-8)
     
-    return -(target_pressure - SIDELOBE_PENALTY * sidelobe_pressure)
+    return -(target_pressure - SIDELOBE_PENALTY * sidelobe_pressure), field
 
+def objective_sidelobe_fwd(lens_params):
+    """Forward pass: compute loss and save intermediate values needed for backward."""
+    field = compute_field(lens_params).on_grid
+    
+    if field.ndim == 4:
+        pressure_magnitude = jnp.abs(field[..., 0])
+        field_slice = field[..., 0]
+    else:
+        pressure_magnitude = jnp.abs(field)
+        field_slice = field
+    
+    # Pre-computed masks
+    target_mask = create_spherical_mask_vectorized(
+        GRID_SIZE_MM[0]/2, GRID_SIZE_MM[1]/2, FOCAL_DISTANCE_MM, TARGET_RADIUS_MM
+    ).astype(DTYPE)
+    
+    sidelobe_region = create_spherical_mask_vectorized(
+        GRID_SIZE_MM[0]/2, GRID_SIZE_MM[1]/2, FOCAL_DISTANCE_MM, SIDELOBE_RADIUS_MM
+    ).astype(DTYPE)
+    
+    sidelobe_mask = sidelobe_region - target_mask
+    
+    # Vectorized calculations
+    target_pressure = jnp.sum(pressure_magnitude * target_mask) / (jnp.sum(target_mask) + 1e-8)
+    sidelobe_pressure = jnp.sum(pressure_magnitude * sidelobe_mask) / (jnp.sum(sidelobe_mask) + 1e-8)
+    
+    loss = -(target_pressure - SIDELOBE_PENALTY * sidelobe_pressure)
+    
+    # Save what we need for backward pass
+    return loss, (field_slice, target_mask, sidelobe_mask, lens_params)
+
+def objective_sidelobe_bwd(res, g):
+    """
+    Backward pass using adjoint method for efficient gradient computation.
+    
+    The adjoint method avoids differentiating through the Helmholtz solver.
+    Instead, we:
+    1. Compute ∂L/∂u (gradient of loss w.r.t. field)
+    2. Solve adjoint equation: H^T λ = ∂L/∂u
+    3. Compute ∂L/∂p = -Re(λ^* · ∂f/∂p) where f is the source term
+    
+    Args:
+        res: Saved values from forward pass (field, masks, lens_params)
+        g: Incoming gradient from autodiff (∂loss/∂loss = 1.0)
+    
+    Returns:
+        Gradient w.r.t. lens_params
+    """
+    field, target_mask, sidelobe_mask, lens_params = res
+    g_loss = g  # This is ∂loss/∂loss = 1.0
+    
+    # Step 1: Compute ∂L/∂u (gradient of loss w.r.t. complex field)
+    eps = 1e-8
+    field_mag = jnp.abs(field) + eps
+    
+    # Gradient contributions from target and sidelobe regions
+    target_sum = jnp.sum(target_mask) + eps
+    sidelobe_sum = jnp.sum(sidelobe_mask) + eps
+    
+    # ∂L/∂|u| for each voxel (note the negative sign from the loss definition)
+    dl_dmag = -g_loss * (target_mask / target_sum - SIDELOBE_PENALTY * sidelobe_mask / sidelobe_sum)
+    
+    # Chain rule for complex field: ∂L/∂u = ∂L/∂|u| · ∂|u|/∂u
+    # For u complex: ∂|u|/∂u = u^*/|u|
+    dl_du = 0.5 * dl_dmag * jnp.conj(field) / field_mag
+    
+    # Step 2: Solve adjoint equation H^T λ = ∂L/∂u
+    # For the Helmholtz equation, H is not self-adjoint due to PML
+    medium = Medium(domain=domain,
+                    sound_speed=params_to_sos(lens_params),
+                    pml_size=10)
+    
+    # Convert to right shape and conjugate for adjoint
+    if dl_du.ndim == 3:
+        dl_du = dl_du[..., None]
+    
+    # Use the adjoint solver with proper PML handling
+    dl_du_conj = jnp.conj(dl_du[..., 0] if dl_du.ndim == 4 else dl_du)
+    lambda_field = solve_adjoint(
+        dl_du_conj=dl_du_conj,
+        domain=domain,
+        fwd_medium=medium,
+        omega=OMEGA,
+        tol=1e-3
+    )
+    
+    # Step 3: Compute gradient w.r.t. lens_params
+    # For the Helmholtz equation: H = ∇² + k²(x)
+    # where k²(x) = ω²/c²(x) depends on lens_params through c(x)
+    # 
+    # The gradient is: ∂L/∂p = Re(λ^* · ∂H/∂p · u)
+    # Since only k² depends on p: ∂H/∂p · u = ∂k²/∂p · u
+    # And ∂k²/∂p = -2ω²/c³ · ∂c/∂p
+    
+    # We need to differentiate through params_to_sos
+    # For efficiency, we use JAX's vjp just for this part
+    def sos_map(params):
+        return params_to_sos(params).on_grid[..., 0]
+    
+    _, vjp_sos = jax.vjp(sos_map, lens_params)
+    
+    # Compute ∂k²/∂c = -2ω²/c³
+    c = params_to_sos(lens_params).on_grid[..., 0]
+    dk2_dc = -2 * OMEGA**2 / (c**3)
+    
+    # Compute λ^* · (∂k²/∂c · u) = λ^* · u · ∂k²/∂c
+    lambda_val = lambda_field.on_grid[..., 0] if lambda_field.on_grid.ndim == 4 else lambda_field.on_grid
+    integrand = jnp.real(jnp.conj(lambda_val) * field * dk2_dc)
+    
+    # Use vjp to pull back through params_to_sos
+    grad_lens_params = vjp_sos(integrand)[0]
+    
+    return (grad_lens_params,)
+
+objective_sidelobe.defvjp(objective_sidelobe_fwd, objective_sidelobe_bwd)
 # ---------------------------------------------------------------------------
 #  OBJECTIVE SHAPE
 def objective_shape(params, amp_target=1.50, alpha=3.0):
@@ -286,8 +465,9 @@ def optimisation_step(params, opt_state):
     updates, opt_state = optimiser.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss
+
 # ---------------------------------------------------------------------------
-#  DEBUG VISUALISATION HELPERS  << NEW >>
+#  DEBUG VISUALISATION HELPERS
 # ---------------------------------------------------------------------------
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -308,7 +488,7 @@ def _save_bowl_source_xz(save_path: str):
     plt.tight_layout(); plt.savefig(save_path, dpi=200); plt.close()
     print("Saved:", save_path)
 
-def _save_pressure_xz(lens_params, tag):                   # << MOD >>
+def _save_pressure_xz(lens_params, tag):
     """
     Save an X‑Z slice of |p|.
     `tag` can be an int (iteration index) or a string such as "no_lens".
@@ -348,7 +528,7 @@ def _save_pressure_xz(lens_params, tag):                   # << MOD >>
     print("Saved:", fname)
 
 # ---------------------------------------------------------------------------
-#  SOS‑HISTOGRAM HELPER       << NEW >>
+#  SOS‑HISTOGRAM HELPER <<< MODIFIED >>>
 # ---------------------------------------------------------------------------
 def _save_sos_hist(lens_params, iter_idx):
     """Save a histogram of the sound‑speed voxels in the optimisable region."""
@@ -362,17 +542,21 @@ def _save_sos_hist(lens_params, iter_idx):
     ].ravel()
 
     plt.figure(figsize=(5, 4))
+    # <<< NEW >>> Updated range for PolyJet materials
     plt.hist(sos_opt, bins=50,
-             range=(float(SOUND_SPEED_WATER), float(SOUND_SPEED_SIL)))
+             range=(float(SOS_AGILUS), float(SOS_VEROCLR)))
     plt.xlabel("Sound speed [m s⁻¹]"); plt.ylabel("Voxel count")
     plt.title(f"sos distribution @ iter {iter_idx:03d}")
+    plt.axvline(float(SOS_AGILUS), color='r', linestyle='--', label='Agilus30')
+    plt.axvline(float(SOS_VEROCLR), color='b', linestyle='--', label='VeroClear')
+    plt.legend()
     plt.tight_layout()
     plt.savefig(f"{OUTDIR}/hist_iter_{iter_idx:03d}.png", dpi=200)
     plt.close()
     print("Saved histogram for iter", iter_idx)
 
 # ---------------------------------------------------------------------------
-#  PRESSURE‑METRIC HELPER     << NEW >>
+#  PRESSURE‑METRIC HELPER
 # ---------------------------------------------------------------------------
 def _target_pressure(lens_params):
     """Return mean |p| in the target sphere (host‑side float)."""
@@ -391,7 +575,7 @@ def _target_pressure(lens_params):
     return float((press * target_mask).sum() / (target_mask.sum() + 1e-8))
 
 # ---------------------------------------------------------------------------
-#  BASELINE (all‑water, "no_lens")         << NEW >>
+#  BASELINE (all‑water, "no_lens")
 # ---------------------------------------------------------------------------
 BASELINE_PARAMS = jnp.full((total_params,), -10.0, dtype=DTYPE)   # sigmoid≈0 → water
 baseline_field  = compute_field(BASELINE_PARAMS).on_grid
@@ -408,9 +592,10 @@ baseline_p = _target_pressure(BASELINE_PARAMS)
 # ---------------------------------------------------------------------------
 _save_bowl_source_xz(f"{OUTDIR}/bowl_source_xz.png")
 
-N_ITERS          = 30
+N_ITERS          = 15
 losses           = []
 pressures        = []          # mean |p| in target each iter
+times            = []
 t0 = time.time()
 
 for i in range(N_ITERS):
@@ -421,6 +606,9 @@ for i in range(N_ITERS):
     p_now = _target_pressure(params)
     pressures.append(p_now)
 
+    t1 = time.time()
+    print(f"Time taken: {t1 - t0:.1f} s")
+    times.append(t1 - t0)
     if i % 5 == 0:
         # percent improvement vs 5 iters before (or baseline for i==0)
         p_prev = baseline_p if i == 0 else pressures[i-5]
@@ -432,12 +620,14 @@ for i in range(N_ITERS):
         _save_pressure_xz(params, i)
         _save_sos_hist(params, i)
 
-print(f"\nFinished in {time.time() - t0:.1f} s")
+t1 = time.time()
+print(f"\nFinished in {t1 - t0:.1f} s")
+print(f"Time per iter: {np.mean(times):.1f} s")
 overall_pct = (pressures[-1] - baseline_p) / abs(baseline_p) * 100.0
 print(f"Mean‑pressure improvement: +{overall_pct:.1f}%  (baseline → final)")
 
 # ---------------------------------------------------------------------------
-#  VISUALISATION & EXPORT  (unchanged except for dtype casts)
+#  VISUALISATION & EXPORT <<< MODIFIED >>>
 # ---------------------------------------------------------------------------
 def save_lens_png(lens_params, fname):
     fig, ax = plt.subplots(1, NUM_LENSES, figsize=(5 * NUM_LENSES, 4))
@@ -446,10 +636,14 @@ def save_lens_png(lens_params, fname):
     for k in range(NUM_LENSES):
         seg = lens_params[k * TOTAL_VOXELS_PER_LENS:(k + 1) * TOTAL_VOXELS_PER_LENS]
         seg = jax.nn.sigmoid(seg).reshape(NUM_XY_SEGMENTS, NUM_XY_SEGMENTS)
-        ax[k].imshow(seg, vmin=0, vmax=1, cmap='RdBu_r',
+        # <<< NEW >>> Updated colormap label
+        im = ax[k].imshow(seg, vmin=0, vmax=1, cmap='RdBu_r',
                      extent=[0, LENS_WIDTH_MM, 0, LENS_WIDTH_MM])
         ax[k].set_title(f"Lens {k+1}")
         ax[k].set_xlabel("mm"); ax[k].set_ylabel("mm")
+        # Add colorbar with material labels
+        cbar = plt.colorbar(im, ax=ax[k])
+        cbar.set_label('Material fraction\n(0=Agilus30, 1=VeroClear)')
     plt.tight_layout(); plt.savefig(fname, dpi=200); plt.close()
 
 save_lens_png(params, f"{OUTDIR}/final_lenses.png")
@@ -459,14 +653,15 @@ plt.figure(figsize=(6,4))
 plt.plot(losses); plt.xlabel("Iteration"); plt.ylabel("Loss"); plt.grid(True)
 plt.tight_layout(); plt.savefig(f"{OUTDIR}/convergence.png", dpi=200); plt.close()
 
-# -- Store parameters & metadata
+# -- Store parameters & metadata <<< MODIFIED >>>
 np.save(f"{OUTDIR}/optimised_params.npy", np.asarray(params, dtype=np.float32))
 with open(f"{OUTDIR}/run.json", "w") as fp:
     json.dump({
         # Optimization info
         "n_iters": N_ITERS,
         "losses": losses,
-        "time_sec": time.time() - t0,
+        "total_time_sec": t1 - t0,
+        "time_per_iter_sec": np.mean(times),
         "grid_voxels": N,
         "dtype": "float32/bfloat16",
         "objective": "sidelobe_suppression" if USE_SIDELOBE_OBJECTIVE else "standard",
@@ -489,7 +684,21 @@ with open(f"{OUTDIR}/run.json", "w") as fp:
             "grid_size_mm": GRID_SIZE_MM,
             "freq_hz": FREQ_HZ,
             "sound_speed_water": float(SOUND_SPEED_WATER),
-            "sound_speed_sil": float(SOUND_SPEED_SIL),
+            # <<< NEW >>> PolyJet material properties
+            "sos_agilus": float(SOS_AGILUS),
+            "sos_veroclr": float(SOS_VEROCLR),
+            "materials": {
+                "agilus30": {
+                    "sos_m_s": float(SOS_AGILUS),
+                    "attenuation_a0_db": AGILUS_A0_DB,
+                    "attenuation_y": AGILUS_Y
+                },
+                "veroclear": {
+                    "sos_m_s": float(SOS_VEROCLR),
+                    "attenuation_a0_db": VERO_A0_DB,
+                    "attenuation_y": VERO_Y
+                }
+            },
             "bowl_diam_mm": BOWL_DIAM_MM,
             "bowl_roc_mm": BOWL_ROC_MM,
             "focal_distance_mm": FOCAL_DISTANCE_MM,
