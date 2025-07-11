@@ -7,10 +7,13 @@ from dataclasses import replace
 import jax.numpy as jnp
 from jwave.geometry import Medium
 from jwave.acoustics.pml import complex_pml_on_grid
-from jwave.acoustics.operators import laplacian_with_pml
+from jwave.acoustics.operators import (
+    laplacian_with_pml, wavevector, scale_source_helmholtz, helmholtz
+)
 from jwave.acoustics.time_harmonic import helmholtz_solver
 from jwave import FourierSeries
-
+from jax.scipy.sparse.linalg import bicgstab, gmres
+import jax
 
 def _conjugate_pml_params(params: dict) -> dict:
     """Return a deep-copied Laplacian-param dict with conjugated PML tensors."""
@@ -51,11 +54,52 @@ def adjoint_rhs(dl_du: jnp.ndarray, domain) -> FourierSeries:
     return FourierSeries(dl_du, domain)
 
 
-def solve_adjoint(dl_du_conj: jnp.ndarray,
+
+def helmholtz_solver_precond(medium, omega, source, params, M, **kwargs):
+    source = scale_source_helmholtz(source, medium)
+
+    def helm_func(u):
+        return helmholtz(u, medium, omega=omega, params=params)
+
+    if kwargs["checkpoint"]:
+        helm_func = jax.checkpoint(helm_func)
+
+    guess = source * 0
+
+    tol = kwargs["tol"] if "tol" in kwargs else 1e-3
+    restart = kwargs["restart"] if "restart" in kwargs else 10
+    maxiter = kwargs["maxiter"] if "maxiter" in kwargs else 1000
+
+    out = gmres(
+        helm_func,
+        source,
+        guess,
+        M=M,
+        tol=tol,
+        restart=restart,
+        maxiter=maxiter,
+        solve_method='batched'
+    )[0]
+
+    return -1j * omega * out
+
+
+def v_cycle(levels, level, v, u, nu1=3, nu2=3):
+    '''
+        Recursive V-cycle for approximating P^{-1} v
+        Where P{-1} u = v 
+        and P{-1} is laplace_shifted Helmholtz operator
+    '''
+    pass
+
+
+def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
                   domain,
                   fwd_medium: Medium,
                   omega: float,
-                  tol: float = 1e-3):
+                  tol: float = 1e-3,
+                  shift: float = 0.5
+                  ):
     """
     Solve H† λ  =  (∂L/∂u)* using GMRES, where H† is the true discrete
     adjoint of JWAVE's PML Helmholtz operator.
@@ -76,11 +120,26 @@ def solve_adjoint(dl_du_conj: jnp.ndarray,
                                                     omega=omega)
     lapl_params = _conjugate_pml_params(lapl_params)
 
+    w = wavevector.default_params(dummy_fs, adj_med, omega=omega) 
+    w_shifted = (1 + 1j * shift) * w
+
+    helm_params = {
+        "laplacian": lapl_params,
+        "wavevector": w_shifted
+    }
+
+    # build approx
+    def preconditioner(v):
+        guess = jnp.zeros_like(v, dtype=complex)
+        return v_cycle(P_levels, 0, v, guess, nu1=3, nu2=3)
+
     # 3. GMRES solve – no checkpointing, gradients stop here
-    λ = helmholtz_solver(adj_med,
-                         omega,
-                         dummy_fs,
-                         tol=tol,
-                         checkpoint=False,
-                         laplacian_params=lapl_params)   # <-- extra kwarg
+    λ = helmholtz_solver_precond(adj_med,
+                        omega,
+                        dummy_fs,
+                        helm_params,
+                        preconditioner,
+                        tol=tol,
+                        checkpoint=False
+                        )
     return λ 
