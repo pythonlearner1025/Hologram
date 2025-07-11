@@ -415,7 +415,7 @@ def objective_sidelobe_bwd(res, g):
     
     # Compute λ^* · (∂k²/∂c · u) = λ^* · u · ∂k²/∂c
     lambda_val = lambda_field.on_grid[..., 0] if lambda_field.on_grid.ndim == 4 else lambda_field.on_grid
-    integrand = jnp.real(jnp.conj(lambda_val) * field * dk2_dc)
+    integrand = -jnp.real(jnp.conj(lambda_val) * field * dk2_dc)
     
     # Use vjp to pull back through params_to_sos
     grad_lens_params = vjp_sos(integrand)[0]
@@ -609,6 +609,7 @@ for i in range(N_ITERS):
     t1 = time.time()
     print(f"Time taken: {t1 - t0:.1f} s")
     times.append(t1 - t0)
+    t0 = time.time()
     if i % 5 == 0:
         # percent improvement vs 5 iters before (or baseline for i==0)
         p_prev = baseline_p if i == 0 else pressures[i-5]

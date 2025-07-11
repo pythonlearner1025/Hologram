@@ -7,7 +7,7 @@ from dataclasses import replace
 import jax.numpy as jnp
 from jwave.geometry import Medium
 from jwave.acoustics.pml import complex_pml_on_grid
-from jwave.acoustics.operators import laplacian_with_pml
+from jwave.acoustics.operators import laplacian_with_pml, wavevector
 from jwave.acoustics.time_harmonic import helmholtz_solver
 from jwave import FourierSeries
 
@@ -70,17 +70,21 @@ def solve_adjoint(dl_du_conj: jnp.ndarray,
 
     # 2. Laplacian parameter bundle + PML conjugation
     #    JWAVE builds this once per operator; we override the PML only.
-    dummy_fs   = adjoint_rhs(dl_du_conj, domain)
-    lapl_params = laplacian_with_pml.default_params(dummy_fs,
-                                                    adj_med,
-                                                    omega=omega)
+    fs   = adjoint_rhs(dl_du_conj, domain)
+    lapl_params = laplacian_with_pml.default_params(fs, adj_med, omega=omega)
     lapl_params = _conjugate_pml_params(lapl_params)
 
+    # Construct full params dict for helmholtz_solver
+    params = {
+        **lapl_params,
+        "wavevector": wavevector.default_params(fs, adj_med, omega=omega)
+    }
+    
     # 3. GMRES solve – no checkpointing, gradients stop here
     λ = helmholtz_solver(adj_med,
                          omega,
-                         dummy_fs,
+                         fs,
                          tol=tol,
                          checkpoint=False,
-                         laplacian_params=lapl_params)   # <-- extra kwarg
+                         params=params)   # <-- extra kwarg
     return λ 
