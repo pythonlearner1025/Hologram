@@ -1,7 +1,7 @@
 from dataclasses import replace
 import jax.numpy as jnp
-from jwave.geometry import Medium
-from jaxdf import Domain, FiniteDifferences
+from jwave.geometry import Medium, Domain
+from jaxdf import  FiniteDifferences
 from jwave.acoustics.pml import complex_pml_on_grid
 from jwave.acoustics.operators import (
     laplacian_with_pml, wavevector, scale_source_helmholtz, helmholtz
@@ -81,20 +81,48 @@ def helmholtz_solver_precond(medium, omega, source, params, M, **kwargs):
 
 def downsample_average(arr):
     shape = arr.shape
+    # Handle odd dimensions by truncating to largest even size
+    even_shape = tuple(s - (s % 2) for s in shape)
+    if even_shape != shape:
+        # Truncate to even dimensions
+        arr = arr[:even_shape[0], :even_shape[1], :even_shape[2]]
+        shape = even_shape
     arr_resh = arr.reshape((shape[0]//2, 2, shape[1]//2, 2, shape[2]//2, 2))
     return arr_resh.mean(axis=(1,3,5))
 
 def prolong(coarse):
     sx, sy, sz = coarse.shape
     fine = jnp.zeros((2*sx, 2*sy, 2*sz), dtype=coarse.dtype)
+    
+    # First, set the coarse values at even indices
     fine = fine.at[0::2, 0::2, 0::2].set(coarse)
-    fine = fine.at[1::2, 0::2, 0::2].set(0.5 * (coarse[:-1,:,:] + coarse[1:,:,:]))
-    fine = fine.at[0::2, 1::2, 0::2].set(0.5 * (fine[0::2,0::2,0::2] + fine[0::2,2::2,0::2]))
-    fine = fine.at[1::2, 1::2, 0::2].set(0.5 * (fine[1::2,0::2,0::2] + fine[1::2,2::2,0::2]))
-    fine = fine.at[0::2, 0::2, 1::2].set(0.5 * (fine[0::2,0::2,0::2] + fine[0::2,0::2,2::2]))
-    fine = fine.at[1::2, 0::2, 1::2].set(0.5 * (fine[1::2,0::2,0::2] + fine[1::2,0::2,2::2]))
-    fine = fine.at[0::2, 1::2, 1::2].set(0.5 * (fine[0::2,1::2,0::2] + fine[0::2,1::2,2::2]))
-    fine = fine.at[1::2, 1::2, 1::2].set(0.5 * (fine[1::2,1::2,0::2] + fine[1::2,1::2,2::2]))
+    
+    # Interpolate in x-direction (handle boundary)
+    if sx > 1:
+        fine = fine.at[1:-1:2, 0::2, 0::2].set(0.5 * (coarse[:-1,:,:] + coarse[1:,:,:]))
+        # Handle last odd index if it exists
+        fine = fine.at[-1, 0::2, 0::2].set(coarse[-1,:,:])
+    
+    # Interpolate in y-direction
+    if sy > 1:
+        fine = fine.at[0::2, 1:-1:2, 0::2].set(0.5 * (fine[0::2,0:-2:2,0::2] + fine[0::2,2::2,0::2]))
+        fine = fine.at[1::2, 1:-1:2, 0::2].set(0.5 * (fine[1::2,0:-2:2,0::2] + fine[1::2,2::2,0::2]))
+        # Handle last odd index if it exists
+        fine = fine.at[0::2, -1, 0::2].set(fine[0::2,-2,0::2])
+        fine = fine.at[1::2, -1, 0::2].set(fine[1::2,-2,0::2])
+    
+    # Interpolate in z-direction
+    if sz > 1:
+        fine = fine.at[0::2, 0::2, 1:-1:2].set(0.5 * (fine[0::2,0::2,0:-2:2] + fine[0::2,0::2,2::2]))
+        fine = fine.at[1::2, 0::2, 1:-1:2].set(0.5 * (fine[1::2,0::2,0:-2:2] + fine[1::2,0::2,2::2]))
+        fine = fine.at[0::2, 1::2, 1:-1:2].set(0.5 * (fine[0::2,1::2,0:-2:2] + fine[0::2,1::2,2::2]))
+        fine = fine.at[1::2, 1::2, 1:-1:2].set(0.5 * (fine[1::2,1::2,0:-2:2] + fine[1::2,1::2,2::2]))
+        # Handle last odd index if it exists
+        fine = fine.at[0::2, 0::2, -1].set(fine[0::2,0::2,-2])
+        fine = fine.at[1::2, 0::2, -1].set(fine[1::2,0::2,-2])
+        fine = fine.at[0::2, 1::2, -1].set(fine[0::2,1::2,-2])
+        fine = fine.at[1::2, 1::2, -1].set(fine[1::2,1::2,-2])
+    
     return fine
 
 def restrict(arr):
@@ -179,7 +207,7 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
 
     # True Helmholtz params (for the operator)
     helm_params = {
-        "laplacian": lapl_params,
+        **lapl_params,
         "wavevector": None  # Forces computation from medium
     }
 
@@ -187,7 +215,18 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
     P_levels = []
     current_med = adj_med
     current_domain = domain
-    while min(current_domain.N) > 32:
+    level_count = 0
+    total_memory_estimate = 0
+    # Set a reasonable maximum number of levels to prevent excessive memory usage
+    MAX_LEVELS = 10  # This allows grids up to 32768 in the finest dimension
+    
+    print(f"Starting multigrid level creation...")
+    print(f"Initial domain size: {current_domain.N}")
+    print(f"Maximum levels allowed: {MAX_LEVELS}")
+    
+    while min(current_domain.N) > 32 and level_count < MAX_LEVELS:
+        level_count += 1
+     
         lapl_params_level = laplacian_with_pml.default_params(
             FiniteDifferences(jnp.zeros(current_domain.N), current_domain, accuracy=2),
             current_med,
@@ -198,8 +237,13 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
         w_shifted_level = (1 + 1j * shift) * w_level
         dx = current_domain.dx[0]
         D = w_shifted_level - (6 / dx**2)  # Approx diag for 3D FD Laplacian
-        current_med_shifted = current_med.replace(
-            sound_speed=current_med.sound_speed / jnp.sqrt(1 + 1j * shift)
+        shifted_sound_speed = current_med.sound_speed / jnp.sqrt(1 + 1j * shift)
+        current_med_shifted = Medium(
+            domain=current_med.domain,
+            sound_speed=shifted_sound_speed,
+            density=current_med.density,
+            attenuation=current_med.attenuation,
+            pml_size=current_med.pml_size
         )
         P_levels.append({
             "domain": current_domain,
@@ -219,8 +263,10 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
         sos_coarse = omega / jnp.sqrt(k2_coarse + 1e-10)  # Avoid div-by-zero
         new_sound_speed = FourierSeries(sos_coarse[..., None], new_domain)
         current_med = Medium(domain=new_domain, sound_speed=new_sound_speed, pml_size=current_med.pml_size)
+        current_domain = new_domain  # CRITICAL: Update current_domain for next iteration!
 
-    # Preconditioner function
+    print(f"Multigrid level creation complete!")
+    print(f"Total levels created: {level_count}")
     def preconditioner(fs_v):
         v = fs_v.on_grid[..., 0]
         guess = jnp.zeros_like(v, dtype=complex)
@@ -228,7 +274,8 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
         return FourierSeries(z[..., None], domain)
 
     # 3. GMRES solve – no checkpointing, gradients stop here
-    λ = helmholtz_solver_precond(adj_med,
+    λ = helmholtz_solver_precond(
+                        adj_med,
                         omega,
                         dummy_fs,
                         helm_params,
@@ -236,4 +283,5 @@ def solve_adjoint_precond(dl_du_conj: jnp.ndarray,
                         tol=tol,
                         checkpoint=False
                         )
+    print(f'solved helmholtz precond')
     return λ 
