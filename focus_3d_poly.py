@@ -33,7 +33,7 @@ from jwave.geometry import Domain, Medium
 from jwave.acoustics.time_harmonic import helmholtz_solver
 
 # Import adjoint utilities
-from adjoint_utils import solve_adjoint
+from adjoint_utils import solve_adjoint_precond
 
 # ---------------------------------------------------------------------------
 #  ARGUMENT PARSER
@@ -73,7 +73,7 @@ BOWL_DIAM_MM = args.bowl_diam_mm
 BOWL_ROC_MM = args.bowl_roc_mm
 NUM_LENSES = args.num_lenses
 transducer_spec = f"OD{int(BOWL_DIAM_MM)}_F{FREQ_MHZ:.1f}MHz_R{int(BOWL_ROC_MM)}_L{NUM_LENSES}"
-OUTDIR = f"/workspace/hologram/test/stacked_3d_poly_{transducer_spec}_{time.strftime('%Y%m%d_%H%M%S')}"
+OUTDIR = f"{os.getcwd()}/hologram/test/stacked_3d_poly_{transducer_spec}_{time.strftime('%Y%m%d_%H%M%S')}"
 os.makedirs(OUTDIR, exist_ok=True)
 OMEGA              = DTYPE(2 * np.pi * FREQ_HZ)
 
@@ -386,7 +386,7 @@ def objective_sidelobe_bwd(res, g):
     
     # Use the adjoint solver with proper PML handling
     dl_du_conj = jnp.conj(dl_du[..., 0] if dl_du.ndim == 4 else dl_du)
-    lambda_field = solve_adjoint(
+    lambda_field = solve_adjoint_precond(
         dl_du_conj=dl_du_conj,
         domain=domain,
         fwd_medium=medium,
