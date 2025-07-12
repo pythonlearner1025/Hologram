@@ -66,11 +66,13 @@ def solve_adjoint(dl_du_conj: jnp.ndarray,
         The adjoint field λ on the grid.
     """
     # 1. Medium copy (same domain & material maps)
-    adj_med = build_adjoint_medium(fwd_medium)
+    adj_med = replace(fwd_medium)
 
     # 2. Laplacian parameter bundle + PML conjugation
     #    JWAVE builds this once per operator; we override the PML only.
-    fs   = adjoint_rhs(dl_du_conj, domain)
+    if dl_du_conj.ndim == 3:
+        dl_du_conj = dl_du_conj[..., None]
+    fs = FourierSeries(dl_du_conj, domain)
     lapl_params = laplacian_with_pml.default_params(fs, adj_med, omega=omega)
     lapl_params = _conjugate_pml_params(lapl_params)
 

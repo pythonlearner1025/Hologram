@@ -1,5 +1,6 @@
 /outs/
 /jaxenv/
+/cpuenv/
 /hologram/
 
 /__pycache__/**/__pycache__
