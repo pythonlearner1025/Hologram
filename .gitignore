@@ -2,6 +2,7 @@
 /jaxenv/
 /cpuenv/
 /hologram/
+/jwave/
 
 /__pycache__/**/__pycache__
 __pycache__/

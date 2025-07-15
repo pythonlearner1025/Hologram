@@ -1,0 +1,41 @@
+{
+  "format": "PolyJet Multi-Material STL Assembly",
+  "materials": {
+    "Agilus30Clr": {
+      "RGB": [
+        255,
+        255,
+        100
+      ],
+      "files": [
+        "lens_1_Agilus30_RGD_FFF00064.stl",
+        "lens_2_Agilus30_RGD_FFF00064.stl",
+        "lens_3_Agilus30_RGD_FFF00064.stl",
+        "lens_4_Agilus30_RGD_FFF00064.stl"
+      ]
+    },
+    "VeroClear": {
+      "RGB": [
+        227,
+        233,
+        253
+      ],
+      "files": [
+        "lens_1_VeroClear_RGD_810.stl",
+        "lens_2_VeroClear_RGD_810.stl",
+        "lens_3_VeroClear_RGD_810.stl",
+        "lens_4_VeroClear_RGD_810.stl"
+      ]
+    }
+  },
+  "instructions": [
+    "1. Generate STL files from the .scad files using:",
+    "   openscad -o lens_N_Agilus30.stl lens_N_Agilus30.scad",
+    "   openscad -o lens_N_VeroClear.stl lens_N_VeroClear.scad",
+    "2. Rename STL files to include RGD material codes:",
+    "   - Agilus30: append '_RGD_FFF00064' before .stl",
+    "   - VeroClear: append '_RGD_810' before .stl",
+    "3. Import all STL files as an assembly in GrabCAD Print",
+    "4. Verify material assignments match the RGD codes"
+  ]
+}

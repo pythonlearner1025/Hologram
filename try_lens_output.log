@@ -1,0 +1,3 @@
+WARNING:2025-07-15 05:08:57,722:jax._src.xla_bridge:969: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+/workspace/hologram/try_lens.py:86: UserWarning: A JAX array is being set as static! This can result in unexpected behavior and is usually a mistake to do.
+  domain = Domain(N, tuple([DX_M] * 3))
