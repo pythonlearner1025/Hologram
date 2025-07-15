@@ -1,0 +1,68 @@
+{
+  "optimization_dir": "/workspace/hologram/test/stacked_3d_poly_OD30_F2.0MHz_R21_L4_20250714_220437",
+  "timestamp": "2025-07-15 06:02:31",
+  "performance": {
+    "baseline_focal": 0.08798889815807343,
+    "original_focal": 0.3306233584880829,
+    "binarized_focal": 0.3312709331512451,
+    "retention_percent": 100.19586476470492,
+    "improvement_over_baseline": 276.4917393966131
+  },
+  "robustness": {
+    "offsets_mm": [
+      0.8291473388671875,
+      -0.15810513496398926,
+      -0.9784541130065918,
+      0.34338831901550293,
+      0.07081484794616699
+    ],
+    "focal_pressures": [
+      0.37223494052886963,
+      0.307632178068161,
+      0.1462913304567337,
+      0.3674008846282959,
+      0.3312709331512451
+    ],
+    "focal_mean": 0.30496605336666105,
+    "focal_std": 0.0828250372129809,
+    "focal_cv_percent": 27.15877268916887
+  },
+  "physical_params": {
+    "num_lenses": 4,
+    "lens_width_mm": 30.0,
+    "lens_thickness_mm": 0.25,
+    "backing_thickness_mm": 0.0,
+    "gap_between_lenses_mm": 0.0,
+    "lens_start_z_mm": 7.375,
+    "voxel_size_mm": 0.5,
+    "num_xy_segments": 60,
+    "total_voxels_per_lens": 3600,
+    "total_params": 14400,
+    "dx_mm": 0.125,
+    "grid_size_mm": [
+      30.0,
+      30.0,
+      25.2
+    ],
+    "freq_hz": 2000000.0,
+    "sound_speed_water": 1500.0,
+    "sos_agilus": 2035.0,
+    "sos_veroclr": 2473.0,
+    "materials": {
+      "agilus30": {
+        "sos_m_s": 2035.0,
+        "attenuation_a0_db": 9.109,
+        "attenuation_y": 1.017
+      },
+      "veroclear": {
+        "sos_m_s": 2473.0,
+        "attenuation_a0_db": 3.696,
+        "attenuation_y": 0.9958
+      }
+    },
+    "bowl_diam_mm": 30.0,
+    "bowl_roc_mm": 21.0,
+    "focal_distance_mm": 22.68,
+    "target_radius_mm": 0.5
+  }
+}

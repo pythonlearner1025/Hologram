@@ -13,7 +13,7 @@ echo "============================================="
 chmod +x focus_3d_poly.py
 
 # Array of lens counts to test
-LENS_COUNTS=(1 2 4)
+LENS_COUNTS=(4)
 
 # OD30*2MHZ R:21
 echo ""
@@ -23,7 +23,7 @@ for num_lenses in "${LENS_COUNTS[@]}"; do
     python3 focus_3d_poly.py --freq-hz 2e6 --bowl-diam-mm 30 --bowl-roc-mm 21 --num-lenses $num_lenses
     echo "--------------------"
 done
-
+'''
 # OD30*2MHZ R:24
 echo ""
 echo "========== OD30*2MHZ R:24 =========="
