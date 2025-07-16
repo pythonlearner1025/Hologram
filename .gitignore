@@ -3,6 +3,7 @@
 /cpuenv/
 /hologram/
 /jwave/
+/data/
 
 /__pycache__/**/__pycache__
 __pycache__/

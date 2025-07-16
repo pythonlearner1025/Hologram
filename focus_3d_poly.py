@@ -386,6 +386,8 @@ def objective_sidelobe_bwd(res, g):
     
     # Use the adjoint solver with proper PML handling
     dl_du_conj = jnp.conj(dl_du[..., 0] if dl_du.ndim == 4 else dl_du)
+
+    # Solve H^T λ = (∂L/∂u)*
     lambda_field = solve_adjoint(
         dl_du_conj=dl_du_conj,
         domain=domain,

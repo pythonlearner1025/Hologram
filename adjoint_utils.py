@@ -8,12 +8,17 @@ import jax.numpy as jnp
 from jwave.geometry import Medium
 from jwave.acoustics.pml import complex_pml_on_grid
 from jwave.acoustics.operators import laplacian_with_pml, wavevector
-from jwave.acoustics.time_harmonic import helmholtz_solver
+from jax.scipy.sparse.linalg import bicgstab
 from jwave import FourierSeries
 
 
 def _conjugate_pml_params(params: dict) -> dict:
-    """Return a deep-copied Laplacian-param dict with conjugated PML tensors."""
+    """
+        Return a deep-copied Laplacian-param dict with conjugated PML tensors. 
+        PML works by 'stretching' coordinate x into complex one x_bar = x + i \int_0^x \sigma{\xi} d\xi   
+        where \sig(x) \geq is a dampening profile. In fwd this dampens outgoing waves, 
+        in bwd it dampens incoming sensitivities. 
+    """
     new_params = dict(params)                       # shallow copy is enough
     pml_list   = params["pml_on_grid"]
     
@@ -30,34 +35,13 @@ def _conjugate_pml_params(params: dict) -> dict:
     new_params["pml_on_grid"] = conjugated_pml
     return new_params
 
-
-def build_adjoint_medium(fwd_med: Medium) -> Medium:
-    """
-    Create a *shallow* clone of `fwd_med`.
-
-    All physical fields (c, ρ, α) stay identical – we'll inject the
-    conjugated stretch tensors downstream, so no modification to the
-    dataclass itself is required.
-    """
-    return replace(fwd_med)                         # dataclasses utility
-
-
-def adjoint_rhs(dl_du: jnp.ndarray, domain) -> FourierSeries:
-    """
-    Pack ∂L/∂u (already conjugated) into a `FourierSeries` that JWAVE expects.
-    """
-    if dl_du.ndim == 3:                             # add channel axis if needed
-        dl_du = dl_du[..., None]
-    return FourierSeries(dl_du, domain)
-
-
 def solve_adjoint(dl_du_conj: jnp.ndarray,
                   domain,
                   fwd_medium: Medium,
                   omega: float,
-                  tol: float = 1e-3):
+                  tol: float = 1e-6):
     """
-    Solve H† λ  =  (∂L/∂u)* using GMRES, where H† is the true discrete
+    Solve H† λ  =  (∂L/∂u)* using Bi-CGSTAB, where H† is the true discrete
     adjoint of JWAVE's PML Helmholtz operator.
 
     Returns
@@ -72,21 +56,54 @@ def solve_adjoint(dl_du_conj: jnp.ndarray,
     #    JWAVE builds this once per operator; we override the PML only.
     if dl_du_conj.ndim == 3:
         dl_du_conj = dl_du_conj[..., None]
+
     fs = FourierSeries(dl_du_conj, domain)
+
     lapl_params = laplacian_with_pml.default_params(fs, adj_med, omega=omega)
     lapl_params = _conjugate_pml_params(lapl_params)
 
-    # Construct full params dict for helmholtz_solver
+    # Construct full params dict
     params = {
         **lapl_params,
         "wavevector": wavevector.default_params(fs, adj_med, omega=omega)
     }
     
-    # 3. GMRES solve – no checkpointing, gradients stop here
-    λ = helmholtz_solver(adj_med,
-                         omega,
-                         fs,
-                         tol=tol,
-                         checkpoint=False,
-                         params=params)   # <-- extra kwarg
+    # 3. Build matrix-free Helmholtz operator for Bi-CGSTAB
+    def helm(v: jnp.ndarray) -> jnp.ndarray:
+        """
+        Apply H† to a complex grid-field `v` and return a same-shaped array.
+        * `v` : (Nx, Ny, Nz) complex64
+        * Returns : H† v   (same dtype/shape)
+        """
+        v_fs = FourierSeries(v[..., None], domain)          # wrap for JWAVE
+        Av   = laplacian_with_pml(v_fs, adj_med, omega=omega,
+                                  params=params).on_grid[..., 0]
+        # Add k²(x) term
+        k2   = params["wavevector"]
+        if k2.ndim == 4:
+            k2 = k2[..., 0]
+        Av  += k2 * v
+        return Av
+
+    # 4. Diagonal (Jacobi) preconditioner
+    dx   = domain.dx[0]                                         # cubic voxels
+    diag = (-6.0 / dx**2) + params["wavevector"]
+    if diag.ndim == 4:                                          # drop channel
+        diag = diag[..., 0]
+    inv_diag = jnp.where(diag != 0, 1.0 / diag, 0.0).astype(jnp.float32)
+    M = lambda r: inv_diag * r                                  # r / diag(A)
+
+    b  = fs.on_grid[..., 0]                                     # right-hand side
+    x0 = jnp.zeros_like(b)
+
+    λ_grid, info = bicgstab(helm, b,
+                            x0=x0,
+                            M=M,
+                            tol=tol,
+                            maxiter=400)
+
+    if info != 0:
+        raise RuntimeError(f"Bi-CGSTAB failed: info={info}")
+
+    λ = FourierSeries(λ_grid[..., None], domain)
     return λ 
